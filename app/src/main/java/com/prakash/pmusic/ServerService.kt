@@ -34,9 +34,14 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlin.random.Random
 
 class ServerService : Service() {
+
+    private class ZipItem(val name: String, val open: () -> InputStream?)
 
     private var server: ApplicationEngine? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
@@ -196,11 +201,18 @@ class ServerService : Service() {
                     val multipart = call.receiveMultipart()
                     multipart.forEachPart { part ->
                         if (part is PartData.FileItem) {
-                            val fileName = part.originalFileName ?: "file_${System.currentTimeMillis()}"
-                            val file = File(targetDir, fileName)
-                            part.streamProvider().use { input ->
-                                file.outputStream().buffered().use { output ->
-                                    input.copyTo(output)
+                            val rawName = part.originalFileName ?: "file_${System.currentTimeMillis()}"
+                            val cleanName = rawName.replace('\\', '/')
+                                .split('/')
+                                .filter { it.isNotEmpty() && it != "." && it != ".." && !it.matches(Regex("^[A-Za-z]:$")) }
+                                .joinToString("/")
+                            if (cleanName.isNotEmpty()) {
+                                val file = File(targetDir, cleanName)
+                                file.parentFile?.mkdirs()
+                                part.streamProvider().use { input ->
+                                    file.outputStream().buffered().use { output ->
+                                        input.copyTo(output)
+                                    }
                                 }
                             }
                         }
@@ -349,6 +361,65 @@ class ServerService : Service() {
                         streamFile(file, call, file.name)
                     } else {
                         call.respond(HttpStatusCode.NotFound, "File not found")
+                    }
+                }
+
+                // Download multiple files as a single ZIP archive
+                get("/download-zip") {
+                    val auth = call.request.queryParameters["auth"]
+                    if (auth != FileSharingRegistry.secretCode) {
+                        call.respond(HttpStatusCode.Unauthorized, "Invalid Key")
+                        return@get
+                    }
+
+                    val paths = call.request.queryParameters.getAll("path") ?: emptyList()
+                    val zipItems = paths.mapNotNull { path ->
+                        if (path.startsWith("shared://")) {
+                            val name = path.removePrefix("shared://")
+                            val uri = FileSharingRegistry.selectedFiles.find { getFileName(it) == name }
+                            uri?.let { ZipItem(name) { contentResolver.openInputStream(it) } }
+                        } else {
+                            val file = File(path)
+                            if (file.isFile) ZipItem(file.name) { FileInputStream(file) } else null
+                        }
+                    }
+
+                    if (zipItems.isEmpty()) {
+                        call.respond(HttpStatusCode.NotFound, "No downloadable files")
+                        return@get
+                    }
+
+                    call.response.header(
+                        HttpHeaders.ContentDisposition,
+                        ContentDisposition.Attachment.withParameter(ContentDisposition.Parameters.FileName, "P-Hub-${zipItems.size}-files.zip").toString()
+                    )
+                    call.respondOutputStream(ContentType.Application.OctetStream) {
+                        val zip = ZipOutputStream(this)
+                        val usedNames = mutableSetOf<String>()
+                        try {
+                            zipItems.forEach { item ->
+                                val base = item.name.substringBeforeLast('.')
+                                val ext = item.name.substringAfterLast('.', "")
+                                var entryName = item.name
+                                var counter = 1
+                                while (entryName in usedNames) {
+                                    entryName = if (ext.isEmpty() || ext == item.name) "$base ($counter)" else "$base ($counter).$ext"
+                                    counter++
+                                }
+                                usedNames.add(entryName)
+
+                                val input = item.open()
+                                if (input != null) {
+                                    input.use {
+                                        zip.putNextEntry(ZipEntry(entryName))
+                                        it.copyTo(zip, 65536)
+                                        zip.closeEntry()
+                                    }
+                                }
+                            }
+                        } finally {
+                            zip.close()
+                        }
                     }
                 }
                 
@@ -640,7 +711,9 @@ class ServerService : Service() {
                         <button class="btn btn-secondary action-btn" id="btnRename" onclick="showModal('rename')" disabled>Rename</button>
                         <button class="btn btn-secondary action-btn" id="btnDelete" onclick="deleteFile()" style="color:#ff5252;" disabled>Del</button>
                         <button class="btn btn-primary" onclick="document.getElementById('uploadInput').click()">Upload</button>
+                        <button class="btn btn-secondary" onclick="document.getElementById('folderInput').click()">Folder</button>
                         <input type="file" id="uploadInput" multiple style="display:none;" onchange="uploadFiles()">
+                        <input type="file" id="folderInput" webkitdirectory multiple style="display:none;" onchange="uploadFiles()">
                     </div>
                 </div>
 
@@ -979,17 +1052,20 @@ class ServerService : Service() {
 
                     function downloadFile(items = selectedItems) {
                         const key = document.getElementById('authKey').value;
-                        items.filter(i => !i.isDir).forEach((item, index) => {
-                            setTimeout(() => {
-                                const url = '/download?auth=' + key + '&path=' + encodeURIComponent(item.path);
-                                const a = document.createElement('a');
-                                a.href = url;
-                                a.download = item.name;
-                                document.body.appendChild(a);
-                                a.click();
-                                document.body.removeChild(a);
-                            }, index * 200);
-                        });
+                        const files = items.filter(i => !i.isDir);
+                        if (files.length === 0) return;
+                        const a = document.createElement('a');
+                        document.body.appendChild(a);
+                        if (files.length === 1) {
+                            a.href = '/download?auth=' + key + '&path=' + encodeURIComponent(files[0].path);
+                            a.download = files[0].name;
+                        } else {
+                            const params = files.map(f => 'path=' + encodeURIComponent(f.path)).join('&');
+                            a.href = '/download-zip?auth=' + key + '&' + params;
+                            a.download = 'P-Hub-' + files.length + '-files.zip';
+                        }
+                        a.click();
+                        document.body.removeChild(a);
                     }
 
                     function deleteFile() {
@@ -1068,40 +1144,102 @@ class ServerService : Service() {
                         });
                     }
 
+                    function traverseEntry(entry, path, items, callback) {
+                        if (entry.isFile) {
+                            entry.file(file => {
+                                items.push({ file: file, relPath: path.concat(file.name).join('/') });
+                                callback();
+                            }, callback);
+                        } else if (entry.isDirectory) {
+                            const reader = entry.createReader();
+                            const readAll = () => {
+                                reader.readEntries(batch => {
+                                    if (batch.length === 0) { callback(); return; }
+                                    let remaining = batch.length;
+                                    batch.forEach(sub => {
+                                        traverseEntry(sub, path.concat(entry.name), items, () => {
+                                            remaining--;
+                                            if (remaining === 0) readAll();
+                                        });
+                                    });
+                                }, callback);
+                            };
+                            readAll();
+                        } else {
+                            callback();
+                        }
+                    }
+
+                    function collectDroppedItems(entries, done) {
+                        const items = [];
+                        let remaining = entries.length;
+                        if (remaining === 0) { done(items); return; }
+                        entries.forEach(entry => {
+                            traverseEntry(entry, [], items, () => {
+                                remaining--;
+                                if (remaining === 0) done(items);
+                            });
+                        });
+                    }
+
                     function handleDrop(e) {
                         e.preventDefault();
                         const view = document.getElementById('fileView');
                         view.style.background = '';
+                        const items = e.dataTransfer && e.dataTransfer.items;
+                        if (items && items.length && typeof items[0].webkitGetAsEntry === 'function') {
+                            const entries = [];
+                            for (let i = 0; i < items.length; i++) {
+                                const entry = items[i].webkitGetAsEntry();
+                                if (entry) entries.push(entry);
+                            }
+                            if (entries.length) {
+                                if (window.innerWidth < 600) document.getElementById('uploadSidebar').classList.add('open');
+                                collectDroppedItems(entries, list => uploadItems(list));
+                                return;
+                            }
+                        }
                         if (e.dataTransfer.files.length) {
                             if (window.innerWidth < 600) document.getElementById('uploadSidebar').classList.add('open');
                             uploadFiles(e.dataTransfer.files);
                         }
                     }
 
-                    function uploadFiles(droppedFiles = null) {
-                        const files = droppedFiles || document.getElementById('uploadInput').files;
+                    function uploadFiles(dropped = null) {
+                        const source = dropped || document.getElementById('uploadInput').files || document.getElementById('folderInput').files;
+                        if (!source || !source.length) return;
+                        const items = [];
+                        for (let i = 0; i < source.length; i++) {
+                            const file = source[i];
+                            const rel = (file.webkitRelativePath || '').split('/').filter(s => s && s !== '.').join('/');
+                            items.push({ file: file, relPath: rel || file.name });
+                        }
+                        uploadItems(items);
+                    }
+
+                    function uploadItems(items) {
                         const key = document.getElementById('authKey').value;
                         const name = document.getElementById('senderName').value;
-                        if (!files.length) return;
+                        if (!items.length) return;
                         
                         localStorage.setItem('phub_sender_name', name);
                         
-                        for (let i = 0; i < files.length; i++) {
-                            const file = files[i];
-                            const uploadId = 'upload_' + Date.now() + '_' + i;
+                        items.forEach((item, index) => {
+                            const file = item.file;
+                            const uploadId = 'upload_' + Date.now() + '_' + index;
                             
                             // Add to sidebar list
                             const list = document.getElementById('uploadList');
                             const div = document.createElement('div');
                             div.className = 'upload-item';
                             div.id = uploadId;
-                            div.innerHTML = '<div class="upload-name">' + file.name + '</div>' +
+                            div.innerHTML = '<div class="upload-name">' + item.relPath + '</div>' +
                                             '<div class="upload-progress"><div class="upload-bar" id="bar_' + uploadId + '"></div></div>' +
                                             '<div class="upload-status"><span id="txt_' + uploadId + '">Uploading...</span><span id="pct_' + uploadId + '">0%</span></div>';
                             list.prepend(div);
                             
                             const fd = new FormData();
-                            fd.append('file', file);
+                            fd.append('file', file, item.relPath);
                             
                             const xhr = new XMLHttpRequest();
                             xhr.open('POST', '/upload?auth=' + key + '&path=' + encodeURIComponent(currentPath) + '&name=' + encodeURIComponent(name), true);
@@ -1127,7 +1265,7 @@ class ServerService : Service() {
                                 }
                             };
                             xhr.send(fd);
-                        }
+                        });
                     }
                 </script>
             </body>
